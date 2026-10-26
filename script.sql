@@ -244,8 +244,10 @@ CREATE TABLE Work_Session (
     PRIMARY KEY (procedure_id, employee_id, start_time),
     FOREIGN KEY (procedure_id) REFERENCES Repair_Procedure(procedure_id) 
         ON DELETE CASCADE ON UPDATE CASCADE,
-    FOREIGN KEY (employee_id) REFERENCES Technician(employee_id) 
-        ON UPDATE CASCADE
+    FOREIGN KEY (employee_id) REFERENCES Technician(employee_id)
+        ON UPDATE CASCADE,
+    CONSTRAINT CK_work_session_times
+        CHECK (end_time IS NULL OR end_time > start_time)
 );
 
 -- 1. Inventory Manager
@@ -404,6 +406,144 @@ CREATE TABLE Restock_Request (
     CONSTRAINT CK_Restock_Request_Quantity
         CHECK (quantity > 0)
 );
+GO
+
+-- Date-order rules. SQL Server has no CREATE ASSERTION and a CHECK can only
+-- see its own row, so each cross-table rule is enforced by triggers on the
+-- tables on both sides of it. Each CREATE TRIGGER must be alone in its batch,
+-- hence the GO lines. They come before the sample data so it gets checked too.
+
+-- A bill can't predate its ticket, and its warranty claims must stay inside
+-- the 90-day window if the billing date changes.
+CREATE TRIGGER trg_billing_date_order
+ON Billing_Statement
+AFTER INSERT, UPDATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+    IF EXISTS (
+        SELECT 1
+        FROM inserted i
+        JOIN Service_Ticket t ON t.ticket_id = i.ticket_id
+        WHERE i.billing_date < CAST(t.received_date_time AS DATE))
+    BEGIN
+        THROW 50004, 'Billing statement rejected: billing date is before the ticket was received.', 1;
+    END;
+    IF EXISTS (
+        SELECT 1
+        FROM inserted i
+        JOIN Warranty_Claim w ON w.ticket_id = i.ticket_id
+        WHERE w.submission_date < i.billing_date
+           OR w.submission_date > DATEADD(DAY, 90, i.billing_date))
+    BEGIN
+        THROW 50005, 'Billing statement rejected: an existing warranty claim would fall outside the 90-day window.', 1;
+    END;
+END;
+GO
+
+-- 90-day store warranty: claim must be filed on/after billing date and within 90 days
+CREATE TRIGGER trg_warranty_claim_window
+ON Warranty_Claim
+AFTER INSERT, UPDATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+    IF EXISTS (
+        SELECT 1
+        FROM inserted i
+        JOIN Billing_Statement b ON b.ticket_id = i.ticket_id
+        WHERE i.submission_date < b.billing_date
+           OR i.submission_date > DATEADD(DAY, 90, b.billing_date))
+    BEGIN
+        THROW 50003, 'Warranty claim rejected: submission date is outside the 90-day store warranty period.', 1;
+    END;
+END;
+GO
+
+CREATE TRIGGER trg_diagnosis_after_received
+ON Diagnostic_Assessment
+AFTER INSERT, UPDATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+    IF EXISTS (
+        SELECT 1
+        FROM inserted i
+        JOIN Service_Ticket t ON t.ticket_id = i.ticket_id
+        WHERE i.date_time < t.received_date_time)
+    BEGIN
+        THROW 50006, 'Diagnostic assessment rejected: it is dated before the ticket was received.', 1;
+    END;
+END;
+GO
+
+CREATE TRIGGER trg_work_after_received
+ON Work_Session
+AFTER INSERT, UPDATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+    IF EXISTS (
+        SELECT 1
+        FROM inserted i
+        JOIN Repair_Procedure p ON p.procedure_id = i.procedure_id
+        JOIN Service_Ticket t ON t.ticket_id = p.ticket_id
+        WHERE i.start_time < t.received_date_time)
+    BEGIN
+        THROW 50007, 'Work session rejected: it starts before the ticket was received.', 1;
+    END;
+END;
+GO
+
+-- Moving a procedure to another ticket must not leave its work sessions
+-- starting before that ticket was received.
+CREATE TRIGGER trg_procedure_ticket_change
+ON Repair_Procedure
+AFTER UPDATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+    IF NOT UPDATE(ticket_id) RETURN;
+    IF EXISTS (
+        SELECT 1
+        FROM inserted i
+        JOIN Service_Ticket t ON t.ticket_id = i.ticket_id
+        JOIN Work_Session w ON w.procedure_id = i.procedure_id
+        WHERE w.start_time < t.received_date_time)
+    BEGIN
+        THROW 50008, 'Repair procedure rejected: its work sessions start before the new ticket was received.', 1;
+    END;
+END;
+GO
+
+-- Moving a ticket's received date later must not leave its bill, diagnoses
+-- or work sessions dated before it.
+CREATE TRIGGER trg_ticket_received_change
+ON Service_Ticket
+AFTER UPDATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+    IF NOT UPDATE(received_date_time) RETURN;
+    IF EXISTS (
+        SELECT 1
+        FROM inserted i
+        WHERE EXISTS (SELECT 1 FROM Billing_Statement b
+                      WHERE b.ticket_id = i.ticket_id
+                        AND b.billing_date < CAST(i.received_date_time AS DATE))
+           OR EXISTS (SELECT 1 FROM Diagnostic_Assessment d
+                      WHERE d.ticket_id = i.ticket_id
+                        AND d.date_time < i.received_date_time)
+           OR EXISTS (SELECT 1 FROM Repair_Procedure p
+                      JOIN Work_Session w ON w.procedure_id = p.procedure_id
+                      WHERE p.ticket_id = i.ticket_id
+                        AND w.start_time < i.received_date_time))
+    BEGIN
+        THROW 50009, 'Service ticket rejected: its bill, diagnoses or work sessions would be dated before it was received.', 1;
+    END;
+END;
+GO
+
 -- Sample data for the main tables.
 -- Run AFTER the schema script (which creates the tables and the original lookup rows).
 
@@ -972,29 +1112,3 @@ FROM OmniTable
 WHERE duration_minutes < 180
 GROUP BY workstation_id, device_category
 ORDER BY workstation_id, device_category;
-
-CREATE ASSERTION billing_after_received CHECK (NOT EXISTS (
-    SELECT 1 FROM Billing_Statement b
-    JOIN Service_Ticket t ON t.ticket_id = b.ticket_id
-    WHERE b.billing_date < CAST(t.received_date_time AS DATE)))
-GO
-CREATE ASSERTION claim_after_billing CHECK (NOT EXISTS (
-    SELECT 1 FROM Warranty_Claim w
-    JOIN Billing_Statement b ON b.ticket_id = w.ticket_id
-    WHERE w.submission_date < b.billing_date))
-GO
-CREATE ASSERTION diagnosis_after_received CHECK (NOT EXISTS (
-    SELECT 1 FROM Diagnostic_Assessment d
-    JOIN Service_Ticket t ON t.ticket_id = d.ticket_id
-    WHERE d.date_time < t.received_date_time))
-GO
-CREATE ASSERTION work_after_received CHECK (NOT EXISTS (
-    SELECT 1 FROM Work_Session w
-    JOIN Repair_Procedure p ON p.procedure_id = w.procedure_id
-    JOIN Service_Ticket t ON t.ticket_id = p.ticket_id
-    WHERE w.start_time < t.received_date_time))
-GO
-
--- Same-row rule, so a plain CHECK works
-ALTER TABLE Work_Session ADD CONSTRAINT CK_work_session_times
-    CHECK (end_time IS NULL OR end_time > start_time);
