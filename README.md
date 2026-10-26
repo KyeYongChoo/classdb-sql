@@ -71,3 +71,10 @@ Other settings (all optional): `MSSQL_SERVER` (default `localhost,1433`),
 | `input/` | CSV files, one table each (file name = table name) |
 | `output/` | `NNN_<kind>.csv/.txt` per command, plus `prompt_log.md` |
 | `other/` | saved assertions and triggers |
+
+## Security note
+
+This setup is not secure. The `sa` password above is public in this repo, and
+`-p 1433:1433` makes SQL Server reachable from other machines on your network,
+so anyone nearby who reads this README can log in. That's fine for a throwaway
+class database with sample data, but don't store anything real in it.
