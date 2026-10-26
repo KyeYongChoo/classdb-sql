@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Written by sqlshell.py on every run
+output/
+other/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
